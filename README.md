@@ -14,8 +14,6 @@
             <li><strong>Country / Region Selection</strong> — choose from a wide range of countries (Ukraine, Germany, USA, UK, France, Japan, South Korea, Austria, Brazil, Russia, Jamaica, Egypt, and more) and pick a station from each region.</li>
             <li><strong>Ukraine built-in</strong> — 27 Ukrainian stations, available offline as fallback and via live fetch (country code UA).</li>
             <li><strong>Custom stations</strong> — add any internet radio in <code>config/radiomod_custom_stations.json</code> (ETS2-style, editable at runtime). Server options in <code>config/radiomod.json</code> (<code>allowCustomStations</code>, <code>customRequireOp</code>, <code>maxStations</code>, <code>fetchLimit</code>).</li>
-            <li><strong>Speakers</strong> — link any number of speaker blocks to one radio (right-click the speaker). All speakers play the same station, each with its own position.</li>
-            <li><strong>Radio Remote</strong> — opens the nearest radio GUI within 32 blocks. Made for radios riding Create trains/contraptions that can't be clicked directly.</li>
             <li><strong>Dynamic Station Fetching</strong> — on the client, stations are fetched live from a radio browser API (stable votes-based ordering, mirror failover, HLS/unsupported codecs filtered out). Fallback station lists are provided for offline use.</li>
         </ul>
         <h1></h1>

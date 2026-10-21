@@ -126,11 +126,12 @@ public class ModPayloads {
         }
 
         // Issues #2/#6 guard: custom/dyn URLs must be http(s); servers can disable customs.
+        // Only custom/dyn stations need URL validation — built-in presets are always allowed.
         String streamUrl = payload.streamUrl();
-        if (streamUrl != null && !streamUrl.isEmpty()) {
-            boolean isCustomId = payload.stationId().startsWith("custom_")
-                    || payload.stationId().startsWith("dyn_");
-            if (isCustomId && !com.radiomod.RadioConfig.isUrlAllowed(streamUrl)) {
+        boolean isCustomId = payload.stationId().startsWith("custom_")
+                || payload.stationId().startsWith("dyn_");
+        if (isCustomId && streamUrl != null && !streamUrl.isEmpty()) {
+            if (!com.radiomod.RadioConfig.isUrlAllowed(streamUrl)) {
                 LOGGER.warn("RadioMod [SERVER]: rejected disallowed custom URL from {}: {}",
                         sender.getName().getString(), streamUrl);
                 return;
