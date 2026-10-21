@@ -1,11 +1,7 @@
 ﻿<div>
-    <h1 align="center" style="display: block; margin-bottom: 10px;">Live Radio Mod
-        <div>
-            <a href="https://modrinth.com/mod/create-live-radio">
-                <img src="https://img.shields.io/modrinth/dt/create-live-radio?logo=modrinth&amp;label=&amp;suffix=%20&amp;style=flat&amp;color=242629&amp;labelColor=5CA424&amp;logoColor=1C1C1C" alt="Modrinth Download"/>
-            </a>
-        </div>
-    </h1>
+    <h1 align="center" style="display: block; margin-bottom: 10px;">Live Radio Mod (forked)
+    <div> Check out <a href="https://github.com/sergejsaenko/radiomod">original repository</a>
+    </div></h1>
     <p align="center">
         A NeoForge mod for Minecraft 1.21.1 that adds a placeable steampunk-style radio block capable of streaming real internet radio stations directly into your game world.
     </p>
