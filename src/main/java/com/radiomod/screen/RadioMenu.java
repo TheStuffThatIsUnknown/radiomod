@@ -11,25 +11,65 @@ import net.minecraft.world.item.ItemStack;
 public class RadioMenu extends AbstractContainerMenu {
 
     public final RadioBlockEntity blockEntity;
+    /** Radio key "radiomod:&lt;UUID&gt;" — always present, even when the BE is not in the client level
+     * (Sable SubLevel, Create contraption/train, unloaded chunk). Issue #4. */
+    public final String radioKey;
+    public final BlockPos radioPos;
 
     // Called server-side from RadioBlockEntity#createMenu
     public RadioMenu(int id, Inventory inv, RadioBlockEntity be) {
         super(ModMenuTypes.RADIO_MENU.get(), id);
         this.blockEntity = be;
+        this.radioKey = be != null ? be.getRadioKey() : "";
+        this.radioPos = be != null ? be.getBlockPos() : BlockPos.ZERO;
+    }
+
+    public RadioMenu(int id, Inventory inv, RadioBlockEntity be, String radioKey, BlockPos pos) {
+        super(ModMenuTypes.RADIO_MENU.get(), id);
+        this.blockEntity = be;
+        this.radioKey = radioKey != null ? radioKey : (be != null ? be.getRadioKey() : "");
+        this.radioPos = pos != null ? pos : (be != null ? be.getBlockPos() : BlockPos.ZERO);
+    }
+
+    /** Effective key for station-selection packets (never null). */
+    public String getRadioKey() {
+        if (blockEntity != null) return blockEntity.getRadioKey();
+        return radioKey != null ? radioKey : "";
+    }
+
+    /** Effective pos for station-selection packets. */
+    public BlockPos getRadioPos() {
+        if (blockEntity != null) return blockEntity.getBlockPos();
+        return radioPos != null ? radioPos : BlockPos.ZERO;
     }
 
     // Called client-side via the registered factory
     public static RadioMenu fromNetwork(int id, Inventory inv, RegistryFriendlyByteBuf buf) {
         BlockPos pos = buf.readBlockPos();
+        String key = "";
+        try {
+            key = buf.readUtf();
+        } catch (Exception ignored) {
+            // Older server / truncated packet — fall back to pos-only lookup.
+        }
         // Primary lookup: block exists in the current client level (normal / main-world case).
         net.minecraft.world.level.block.entity.BlockEntity raw = inv.player.level().getBlockEntity(pos);
         RadioBlockEntity be = raw instanceof RadioBlockEntity r ? r : null;
 
-        // If null the block is either in a Sable SubLevel or the chunk is not yet loaded.
-        // We still proceed – the menu will render, and station-selection packets include
-        // the radioKey so the server can locate the entity via its global registry.
-        // A null blockEntity is handled defensively in the rest of the menu / screen.
-        return new RadioMenu(id, inv, be);
+        // Fallback: resolve via the global registry (Sable SubLevel, Create
+        // contraption/train in issue #4, or chunk not yet loaded on the client).
+        if (be == null && key != null && !key.isEmpty()) {
+            try {
+                be = RadioBlockEntity.findByKey(key);
+            } catch (Exception ignored) {
+            }
+        }
+
+        // We still proceed with a null blockEntity – the menu will render, and
+        // station-selection packets include the radioKey so the server can locate
+        // the entity via its global registry. Null is handled defensively in
+        // the rest of the menu / screen.
+        return new RadioMenu(id, inv, be, key, pos);
     }
 
     @Override
@@ -39,7 +79,12 @@ public class RadioMenu extends AbstractContainerMenu {
 
     @Override
     public boolean stillValid(Player player) {
-        if (blockEntity == null) return false;
+        // Issue #4: when the BE is not in the client level (contraption/train,
+        // SubLevel, unloaded chunk) we still keep the menu open as long as we
+        // know which radio it belongs to — the server validates on select.
+        if (blockEntity == null) {
+            return radioKey != null && !radioKey.isEmpty();
+        }
 
         // Normal proximity check for plain-world radios.
         double distSq = player.distanceToSqr(
@@ -63,7 +108,7 @@ public class RadioMenu extends AbstractContainerMenu {
             }
         } catch (Exception ignored) { /* not a ServerLevel or no server ref */ }
 
-        // Client side or SubLevel (physics object) — keep the menu open
+        // Client side, SubLevel (physics object) or contraption (Create train) — keep open
         return true;
     }
 }

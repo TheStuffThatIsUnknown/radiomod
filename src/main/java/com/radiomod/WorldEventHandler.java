@@ -15,6 +15,35 @@ import net.neoforged.neoforge.network.PacketDistributor;
 
 public class WorldEventHandler {
 
+    /**
+     * Syncs already-playing radios (and their linked speakers) to a player
+     * who just joined, so they hear ongoing stations without anyone reselecting.
+     * Only loaded block entities are covered — radios in unloaded chunks start
+     * playing for the player once their chunk loads and someone interacts.
+     */
+    @SubscribeEvent
+    public static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (!(event.getEntity() instanceof ServerPlayer sp)) return;
+        try {
+            for (RadioBlockEntity radio : RadioBlockEntity.streamAll()) {
+                if (radio.isRemoved()) continue;
+                String station = radio.getCurrentStation();
+                if (station == null || station.isBlank() || "off".equals(station)) continue;
+                String url = radio.getLastStreamUrl();
+                if (url == null || url.isEmpty()) {
+                    url = com.radiomod.radio.RadioStation.getById(station).getStreamUrl();
+                }
+                net.minecraft.world.phys.Vec3 worldPos =
+                        com.radiomod.network.ModPayloads.resolveWorldPosition(radio);
+                if (worldPos == null) continue;
+                PacketDistributor.sendToPlayer(sp, new ModPayloads.StationBroadcastPayload(
+                        BlockPos.containing(worldPos), station, radio.getRadioKey(),
+                        url != null ? url : ""));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     @SubscribeEvent
     public static void onBlockBreak(BlockEvent.BreakEvent event) {
         BlockPos pos = event.getPos();
@@ -25,6 +54,7 @@ public class WorldEventHandler {
             for (ServerPlayer sp : ((ServerLevel) event.getLevel()).getServer().getPlayerList().getPlayers()) {
                 PacketDistributor.sendToPlayer(sp, pkt);
             }
+            ServerTickHandler.untrackRadio(radio.getRadioKey());
         }
     }
 

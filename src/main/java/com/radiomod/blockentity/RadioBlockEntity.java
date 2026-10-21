@@ -28,6 +28,12 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
 
     private String currentStation = "off";
     private UUID radioId = UUID.randomUUID();
+    /**
+     * Last stream URL received from the selecting client. Kept server-side so
+     * speaker mirrors and position rebroadcasts reuse the exact URL even for
+     * dynamic/custom stations the server itself never fetched (issues #2/#6).
+     */
+    private String lastStreamUrl = "";
 
     private static final ConcurrentHashMap<String, WeakReference<RadioBlockEntity>>
             REGISTRY = new ConcurrentHashMap<>();
@@ -48,6 +54,17 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
             return null;
         }
         return be;
+    }
+
+    /** All live radios. */
+    public static java.util.List<RadioBlockEntity> streamAll() {
+        java.util.List<RadioBlockEntity> out = new java.util.ArrayList<>();
+        for (var e : REGISTRY.entrySet()) {
+            RadioBlockEntity be = e.getValue().get();
+            if (be == null || be.isRemoved()) continue;
+            out.add(be);
+        }
+        return out;
     }
 
     public RadioBlockEntity(BlockPos pos, BlockState state) {
@@ -82,13 +99,32 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
         return currentStation;
     }
 
+    public String getLastStreamUrl() {
+        return lastStreamUrl;
+    }
+
     /**
      * Sets the current station and synchronizes the block to clients.
      *
      * @param stationId Station ID or "off" to disable
      */
     public void setCurrentStation(String stationId) {
+        setCurrentStation(stationId, this.lastStreamUrl);
+    }
+
+    /**
+     * Sets the current station plus the stream URL reported by the selecting client.
+     *
+     * @param stationId Station ID or "off" to disable
+     * @param streamUrl Direct stream URL (may be empty → clients resolve via registry)
+     */
+    public void setCurrentStation(String stationId, String streamUrl) {
         this.currentStation = stationId;
+        if (streamUrl != null && !streamUrl.isEmpty()) {
+            this.lastStreamUrl = streamUrl;
+        } else if ("off".equals(stationId) || stationId.isBlank()) {
+            this.lastStreamUrl = "";
+        }
         setChanged();
         if (level != null && !level.isClientSide()) {
             level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(), 3);
@@ -100,6 +136,7 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
         super.saveAdditional(tag, registries);
         tag.putString("CurrentStation", currentStation);
         tag.putUUID("RadioId", radioId);
+        tag.putString("LastStreamUrl", lastStreamUrl);
     }
 
     @Override
@@ -109,6 +146,7 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
         if (tag.hasUUID("RadioId")) {
             radioId = tag.getUUID("RadioId");
         }
+        lastStreamUrl = tag.contains("LastStreamUrl") ? tag.getString("LastStreamUrl") : "";
     }
 
     @Override
@@ -116,6 +154,7 @@ public class RadioBlockEntity extends BlockEntity implements MenuProvider {
         CompoundTag tag = super.getUpdateTag(registries);
         tag.putString("CurrentStation", currentStation);
         tag.putUUID("RadioId", radioId);
+        tag.putString("LastStreamUrl", lastStreamUrl);
         return tag;
     }
 

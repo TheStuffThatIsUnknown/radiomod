@@ -74,8 +74,9 @@ public class RadioBlock extends BaseEntityBlock {
     }
 
     /**
-     * Determines the facing direction when placed. Corrects for SubLevel rotation
-     * so the block faces the player.
+     * Determines the facing direction when placed. The block is oriented with its
+     * front facing away from the player (standard Minecraft directional-block
+     * behavior), correcting for SubLevel rotation so placement is consistent.
      *
      * @param ctx BlockPlaceContext with player yaw and target position
      * @return BlockState with correct FACING value (0-7)
@@ -92,7 +93,9 @@ public class RadioBlock extends BaseEntityBlock {
 
         float normalized = ((yaw % 360) + 360) % 360;
         int sector = (int) Math.floor((normalized + 22.5f) / 45f) % 8;
-        return defaultBlockState().setValue(FACING, sector);
+        // +4 turns the block so its front faces away from the player, keeping the
+        // outline (SHAPES) and blockstate model rotation aligned.
+        return defaultBlockState().setValue(FACING, (sector + 4) % 8);
     }
 
     /**
@@ -202,6 +205,8 @@ public class RadioBlock extends BaseEntityBlock {
 
     /**
      * Opens the radio GUI on right-click. Server-side only.
+     * The radio key is sent along so the menu also works when the block entity
+     * is not in the client level (Sable SubLevel, Create contraption/train).
      *
      * @return SUCCESS on both sides
      */
@@ -211,7 +216,11 @@ public class RadioBlock extends BaseEntityBlock {
         if (!level.isClientSide()) {
             BlockEntity be = level.getBlockEntity(pos);
             if (be instanceof RadioBlockEntity radio) {
-                ((ServerPlayer) player).openMenu(radio, buf -> buf.writeBlockPos(pos));
+                String key = radio.getRadioKey();
+                ((ServerPlayer) player).openMenu(radio, buf -> {
+                    buf.writeBlockPos(pos);
+                    buf.writeUtf(key);
+                });
             }
         }
         return InteractionResult.sidedSuccess(level.isClientSide());

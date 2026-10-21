@@ -1,10 +1,10 @@
 plugins {
     id 'java-library'
-    id 'net.neoforged.gradle.userdev' version '7.0.145'
+    id 'net.neoforged.gradle.userdev' version '7.1.38'
     id 'maven-publish'
 }
 
-version = '1.0.2'
+version = '1.1.0'
 group = 'com.radiomod'
 base.archivesName = 'radiomod'
 
@@ -37,17 +37,15 @@ repositories {
 }
 
 dependencies {
-    // NeoForge 1.21.1  (update to the latest recommended build at https://projects.neoforged.net/neoforged/neoforge)
-    implementation "net.neoforged:neoforge:21.1.77"
+    // NeoForge 1.21.1  (latest 21.1.x build, see https://maven.neoforged.net/releases/net/neoforged/neoforge/)
+    implementation "net.neoforged:neoforge:21.1.251"
 
-    // ── Audio library (JLayer / mp3spi / tritonus) ────────────────────
-    // compileOnly: provides javazoom.jl.* classes at compile time
+    // ── Audio libraries ─────────────────────────────────────────────
+    // MP3 via JLayer/mp3spi, AAC/AAC+ via JAAD (pure-Java, no natives).
+    // compileOnly: provides decoder classes at compile time
     // jarJar:      bundles the jars inside META-INF/jarjar/ in the mod jar.
-    //              NeoForge JarInJar deduplication logic:
-    //                • if mp3spi (or a compatible version) is already on the
-    //                  classpath (e.g. provided by another mod) → use that
-    //                • otherwise → extract the bundled jar automatically
     compileOnly('com.googlecode.soundlibs:mp3spi:1.9.5.4') { transitive = true }
+    compileOnly('de.sfuhrm:jaad:0.8.7') { transitive = false }
 
     jarJar('com.googlecode.soundlibs:mp3spi') {
         version {
@@ -67,12 +65,20 @@ dependencies {
             prefer '0.3.7.4'
         }
     }
+    // JAAD — AAC-LC / HE-AAC (AAC+) decoder, pure Java, no natives.
+    // (de.sfuhrm repackaging of JAADec on Maven Central; packages net.sourceforge.jaad.*)
+    jarJar('de.sfuhrm:jaad') {
+        version {
+            strictly '[0.8.7,1.0)'
+            prefer '0.8.7'
+        }
+    }
 
-    // JEI (optional integration — compile-only)
-    compileOnly('mezz.jei:jei-1.21.1-neoforge-api:19.21.0.247')
+    // JEI (optional integration — compile-only, latest 1.21.1 NeoForge release)
+    compileOnly('mezz.jei:jei-1.21.1-neoforge-api:19.51.0.418')
 }
 
-// jarJar output = the deployable mod jar (no classifier = "radiomod-1.0.0.jar")
+// jarJar output = the deployable mod jar (no classifier = "radiomod-1.1.0.jar")
 tasks.named('jarJar') {
     archiveClassifier = ''
 }

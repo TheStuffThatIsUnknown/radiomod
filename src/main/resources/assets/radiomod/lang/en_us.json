@@ -21,5 +21,9 @@
   "gui.radiomod.country.egypt": "Egypt",
   "gui.radiomod.country.brazil": "Brazil",
   "gui.radiomod.country.jamaica": "Jamaica",
-  "gui.radiomod.country.russia": "Russia"
+  "gui.radiomod.country.russia": "Russia",
+  "gui.radiomod.country.ukraine": "Ukraine",
+  "gui.radiomod.country.custom": "Custom",
+  "gui.radiomod.custom.hint": "Edit config/radiomod_custom_stations.json",
+  "gui.radiomod.custom.empty": "No custom stations — see config file"
 }

@@ -19,9 +19,9 @@ public class ModCreativeTab {
             () -> CreativeModeTab.builder()
                     .icon(() -> new ItemStack(ModBlocks.RADIO_BLOCK_ITEM.get()))
                     .title(Component.translatable("itemGroup.radiomod"))
-                    .displayItems((params, output) ->
-                            output.accept(ModBlocks.RADIO_BLOCK_ITEM.get())
-                    )
+                    .displayItems((params, output) -> {
+                        output.accept(ModBlocks.RADIO_BLOCK_ITEM.get());
+                    })
                     .build()
     );
 

@@ -10,6 +10,7 @@ import net.neoforged.api.distmarker.OnlyIn;
 import org.slf4j.Logger;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URI;
@@ -18,8 +19,11 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -27,14 +31,36 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Fetches radio stations from radio-browser.info for any country.
  * Results are cached per country code. For "local" mode, uses IP geolocation first.
+ *
+ * <p>Fixes for issue #8 (station list missing entries / unstable):
+ * <ul>
+ *   <li>Stable ordering by {@code votes} instead of volatile {@code clickcount}.</li>
+ *   <li>Mirror failover across de1/de2/nl1 instead of a single hardcoded host.</li>
+ *   <li>No aggressive regional-variant dedup — only exact name+URL duplicates are removed,
+ *       so all stations for a location are actually shown.</li>
+ *   <li>Limits come from {@code config/radiomod.json} (maxStations/fetchLimit).</li>
+ *   <li>HLS (m3u8) entries are filtered out — the in-game player handles direct
+ *       MP3 / AAC / AAC+ streams only.</li>
+ * </ul>
+ *
+ * <p>Fix for issue #7: the API query no longer hardcodes {@code codec=MP3};
+ * AAC and AAC+ stations are accepted and played via the bundled JAAD decoder.
  */
 @OnlyIn(Dist.CLIENT)
 public class LocalStationFetcher {
 
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final int MAX_RESULTS = 15;   // unique stations returned to the UI
-    private static final int FETCH_LIMIT = 60;   // how many to fetch from API before dedup
     private static final int TIMEOUT_MS = 8000;
+
+    /** Mirrors, tried in order (see https://api.radio-browser.info). */
+    private static final String[] MIRRORS = {
+            "https://de1.api.radio-browser.info",
+            "https://de2.api.radio-browser.info",
+            "https://nl1.api.radio-browser.info"
+    };
+
+    /** Codecs the in-game player can actually decode (MP3 via JLayer, AAC/AAC+ via JAAD). */
+    private static final Set<String> SUPPORTED_CODECS = Set.of("MP3", "AAC", "AAC+");
 
     // Cache: countryCode -> fetched station list (null = not yet fetched, empty list = failed)
     private static final Map<String, List<RadioStation>> cache = new ConcurrentHashMap<>();
@@ -126,21 +152,40 @@ public class LocalStationFetcher {
         CompletableFuture.runAsync(() -> {
             try {
                 LOGGER.info("RadioMod: Detecting location...");
-                String geoJson = httpGet("http://ip-api.com/json/?fields=country,regionName,city,countryCode");
-                JsonObject geo = JsonParser.parseString(geoJson).getAsJsonObject();
-
-                String cc = geo.has("countryCode") ? geo.get("countryCode").getAsString() : "DE";
-                String state = geo.has("regionName") ? geo.get("regionName").getAsString() : "";
-                String country = geo.has("country") ? geo.get("country").getAsString() : "";
-                String city = geo.has("city") ? geo.get("city").getAsString() : "";
+                String cc = null, state = "", country = "", city = "";
+                // Primary: ip-api.com (free tier, http only)
+                try {
+                    String geoJson = httpGet("http://ip-api.com/json/?fields=country,regionName,city,countryCode");
+                    JsonObject geo = JsonParser.parseString(geoJson).getAsJsonObject();
+                    cc = geo.has("countryCode") ? geo.get("countryCode").getAsString() : null;
+                    state = geo.has("regionName") ? geo.get("regionName").getAsString() : "";
+                    country = geo.has("country") ? geo.get("country").getAsString() : "";
+                    city = geo.has("city") ? geo.get("city").getAsString() : "";
+                } catch (Exception e) {
+                    LOGGER.debug("RadioMod: primary geolocation failed: {}", e.getMessage());
+                }
+                // Fallback: ipapi.co (https, no key for basic fields)
+                if (cc == null || cc.isEmpty()) {
+                    try {
+                        String geoJson = httpGet("https://ipapi.co/json/");
+                        JsonObject geo = JsonParser.parseString(geoJson).getAsJsonObject();
+                        cc = geo.has("country_code") ? geo.get("country_code").getAsString() : "DE";
+                        state = geo.has("region") ? geo.get("region").getAsString() : "";
+                        country = geo.has("country_name") ? geo.get("country_name").getAsString() : "";
+                        city = geo.has("city") ? geo.get("city").getAsString() : "";
+                    } catch (Exception e) {
+                        LOGGER.debug("RadioMod: fallback geolocation failed: {}", e.getMessage());
+                    }
+                }
+                if (cc == null || cc.isEmpty()) cc = "DE";
 
                 detectedCountryCode.set(cc);
-                detectedState.set(state);
-                detectedCountryName.set(country);
+                detectedState.set(state != null ? state : "");
+                detectedCountryName.set(country != null ? country : "");
                 LOGGER.info("RadioMod: Location: {}, {}, {} ({})", city, state, country, cc);
 
                 // Immediately start fetching for this country
-                fetchForCountry(cc, state);
+                fetchForCountry(cc, detectedState.get());
 
             } catch (Exception e) {
                 LOGGER.warn("RadioMod: Geolocation failed: {}", e.getMessage());
@@ -152,10 +197,11 @@ public class LocalStationFetcher {
 
     private static void fetchForCountry(String countryCode, String state) {
         try {
+            ensureConfigLoaded();
             List<RadioStation> stations;
 
             // If we have a state, try local first for better results
-            if (!state.isEmpty()) {
+            if (state != null && !state.isEmpty()) {
                 stations = queryRadioBrowser(countryCode, state);
                 if (stations.size() >= 6) {  // need at least 6 unique regional results to use them
                     cache.put(countryCode, Collections.unmodifiableList(stations));
@@ -175,98 +221,126 @@ public class LocalStationFetcher {
         }
     }
 
-    private static List<RadioStation> queryRadioBrowser(String countryCode, String state) {
+    private static void ensureConfigLoaded() {
         try {
-            StringBuilder url = new StringBuilder();
-            url.append("https://de1.api.radio-browser.info/json/stations/search?");
-            url.append("countrycode=").append(URLEncoder.encode(countryCode, StandardCharsets.UTF_8.name()));
-            url.append("&codec=MP3");
-            url.append("&bitrateMin=64");          // lower threshold so more stations qualify
-            url.append("&limit=").append(FETCH_LIMIT);  // fetch many, deduplicate down to MAX_RESULTS
-            url.append("&order=clickcount");        // clickcount = actual usage, not just votes
-            url.append("&reverse=true");
-            url.append("&hidebroken=true");
-            if (!state.isEmpty()) {
-                url.append("&state=").append(URLEncoder.encode(state, StandardCharsets.UTF_8.name()));
-            }
-
-            String json = httpGet(url.toString());
-            JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
-
-            List<RadioStation> result = new ArrayList<>();
-            // Use a set of normalized base-names to catch regional variants
-            // e.g. "WDR 2 Rhein", "WDR 2 Ostwestfalen", "WDR 2" all share base "wdr 2"
-            java.util.Set<String> seenBases = new java.util.HashSet<>();
-            for (JsonElement elem : arr) {
-                JsonObject obj = elem.getAsJsonObject();
-                String name = obj.has("name") ? obj.get("name").getAsString().trim() : "";
-                String streamUrl = obj.has("url_resolved") ? obj.get("url_resolved").getAsString().trim() : "";
-                String uuid = obj.has("stationuuid") ? obj.get("stationuuid").getAsString() : "";
-
-                if (name.isEmpty() || streamUrl.isEmpty()) continue;
-                if (name.length() > 32) name = name.substring(0, 30) + "..";
-
-                // Derive a "base name": lowercase, strip trailing regional word(s)
-                // A regional suffix is defined as: one or more words at the end that
-                // are NOT found as a standalone name among already-accepted results,
-                // i.e. we simply compare against all prefixes of the current name.
-                String baseName = deriveBaseName(name.toLowerCase());
-
-                // Check if this base already exists, or if an accepted base is a prefix of this one
-                boolean duplicate = false;
-                for (String seen : seenBases) {
-                    if (seen.equals(baseName)
-                            || baseName.startsWith(seen + " ")
-                            || seen.startsWith(baseName + " ")) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) continue;
-                seenBases.add(baseName);
-
-                String id = "dyn_" + uuid.substring(0, Math.min(8, uuid.length()));
-                result.add(new RadioStation(id, name, streamUrl));
-                if (result.size() >= MAX_RESULTS) break;
-            }
-            return result;
-
-        } catch (Exception e) {
-            LOGGER.debug("RadioMod: radio-browser query failed for {}: {}", countryCode, e.getMessage());
-            return Collections.emptyList();
+            com.radiomod.RadioConfig.load();
+        } catch (Throwable ignored) {
         }
     }
 
-    /**
-     * Derives a "base name" by stripping common trailing regional qualifiers.
-     * Examples:
-     * "wdr 2 rhein"       -> "wdr 2"
-     * "wdr 2 ostwestfalen"-> "wdr 2"
-     * "wdr 2"             -> "wdr 2"
-     * "ndr 2"             -> "ndr 2"
-     */
-    private static String deriveBaseName(String lower) {
-        // Split into words; strip trailing word(s) if they look like region names
-        // (longer than 3 chars, not a number, not part of the "core" identifier)
-        String[] words = lower.trim().split("\\s+");
-        if (words.length <= 2) return lower.trim();
-        // Keep stripping the last word if it is an alphabetic region qualifier
-        // (more than 3 chars, all letters or hyphens, not a frequency like "97.8")
-        int end = words.length;
-        while (end > 2) {
-            String last = words[end - 1];
-            if (last.matches("[a-z][a-z\\-]{3,}")) {
-                end--;
-            } else {
-                break;
+    private static int maxResults() {
+        try {
+            return com.radiomod.RadioConfig.maxStations;
+        } catch (Throwable t) {
+            return 25;
+        }
+    }
+
+    private static int fetchLimit() {
+        try {
+            return com.radiomod.RadioConfig.fetchLimit;
+        } catch (Throwable t) {
+            return 100;
+        }
+    }
+
+    private static List<RadioStation> queryRadioBrowser(String countryCode, String state) {
+        List<RadioStation> best = Collections.emptyList();
+        Exception lastError = null;
+        for (String mirror : MIRRORS) {
+            try {
+                List<RadioStation> got = queryMirror(mirror, countryCode, state);
+                if (!got.isEmpty()) return got;
+                if (got.size() > best.size()) best = got;
+            } catch (Exception e) {
+                lastError = e;
+                LOGGER.debug("RadioMod: mirror {} failed for {}: {}", mirror, countryCode, e.getMessage());
             }
         }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < end; i++) {
-            if (i > 0) sb.append(' ');
-            sb.append(words[i]);
+        if (lastError != null && best.isEmpty()) {
+            LOGGER.debug("RadioMod: radio-browser query failed for {}: {}", countryCode, lastError.getMessage());
         }
-        return sb.toString();
+        return best;
+    }
+
+    private static List<RadioStation> queryMirror(String mirror, String countryCode, String state) throws Exception {
+        StringBuilder url = new StringBuilder();
+        url.append(mirror).append("/json/stations/search?");
+        url.append("countrycode=").append(URLEncoder.encode(countryCode, StandardCharsets.UTF_8.name()));
+        // NOTE: no codec= filter here (issue #7) — we accept MP3 + AAC/AAC+ and
+        // filter client-side to what the player can decode.
+        url.append("&bitrateMin=64");
+        url.append("&limit=").append(fetchLimit());
+        // votes = stable popularity ranking; clickcount fluctuates hourly (issue #8)
+        url.append("&order=votes");
+        url.append("&reverse=true");
+        url.append("&hidebroken=true");
+        if (state != null && !state.isEmpty()) {
+            url.append("&state=").append(URLEncoder.encode(state, StandardCharsets.UTF_8.name()));
+        }
+
+        String json = httpGet(url.toString());
+        JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
+
+        // Collect candidates with votes for a stable client-side sort.
+        record Candidate(RadioStation station, int votes, String normName, String streamUrl) {
+        }
+        List<Candidate> candidates = new ArrayList<>();
+        Set<String> seenNames = new HashSet<>();
+        Set<String> seenUrls = new HashSet<>();
+        for (JsonElement elem : arr) {
+            JsonObject obj = elem.getAsJsonObject();
+            String name = obj.has("name") ? obj.get("name").getAsString().trim() : "";
+            String streamUrl = obj.has("url_resolved") ? obj.get("url_resolved").getAsString().trim() : "";
+            String uuid = obj.has("stationuuid") ? obj.get("stationuuid").getAsString() : "";
+            String codec = obj.has("codec") ? obj.get("codec").getAsString().trim().toUpperCase() : "MP3";
+            int hls = 0;
+            try {
+                hls = obj.has("hls") ? obj.get("hls").getAsInt() : 0;
+            } catch (Exception ignored) {
+            }
+            int votes = 0;
+            try {
+                votes = obj.has("votes") ? obj.get("votes").getAsInt() : 0;
+            } catch (Exception ignored) {
+            }
+
+            if (name.isEmpty() || streamUrl.isEmpty()) continue;
+            if (hls != 0) continue; // m3u8 playlists are not direct streams
+            if (!SUPPORTED_CODECS.contains(codec)) continue; // e.g. OGG/FLAC/OPUS — not decodable in-game
+            if (!(streamUrl.startsWith("http://") || streamUrl.startsWith("https://"))) continue;
+            if (name.length() > 32) name = name.substring(0, 30) + "..";
+
+            // Issue #8 fix: dedup ONLY exact duplicates (normalized name or identical URL).
+            // The old base-name/prefix logic hid most regional stations.
+            String norm = normalizeName(name);
+            if (seenNames.contains(norm)) continue;
+            if (!seenUrls.add(streamUrl)) continue;
+            seenNames.add(norm);
+
+            String id = "dyn_" + uuid.substring(0, Math.min(8, uuid.length()));
+            candidates.add(new Candidate(new RadioStation(id, name, streamUrl), votes, norm, streamUrl));
+        }
+
+        // Stable order: votes desc, then name asc (deterministic across restarts).
+        candidates.sort(Comparator.comparingInt(Candidate::votes).reversed()
+                .thenComparing(Candidate::normName));
+
+        List<RadioStation> result = new ArrayList<>();
+        int max = Math.max(5, Math.min(60, maxResults()));
+        for (Candidate c : candidates) {
+            result.add(c.station());
+            if (result.size() >= max) break;
+        }
+        return result;
+    }
+
+    /** Lowercase, strip punctuation/extra spaces — for exact-duplicate detection only. */
+    private static String normalizeName(String name) {
+        return name.toLowerCase()
+                .replaceAll("[^a-z0-9а-яїієґ ]", "")
+                .replaceAll("\\s+", " ")
+                .trim();
     }
 
     private static String httpGet(String urlStr) throws Exception {
@@ -275,8 +349,14 @@ public class LocalStationFetcher {
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(TIMEOUT_MS);
         conn.setReadTimeout(TIMEOUT_MS);
-        conn.setRequestProperty("User-Agent", "RadioMod/1.0 Minecraft");
+        conn.setRequestProperty("User-Agent", "RadioMod/1.1 Minecraft");
+        conn.setInstanceFollowRedirects(true);
 
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            conn.disconnect();
+            throw new IOException("HTTP " + code + " for " + urlStr);
+        }
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();

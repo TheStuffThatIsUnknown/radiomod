@@ -17,6 +17,13 @@ public class RadioMod {
     private static final Logger LOGGER = LogUtils.getLogger();
 
     public RadioMod(IEventBus modEventBus) {
+        // Load JSON configs (general + custom stations, issues #2/#6)
+        try {
+            RadioConfig.load();
+        } catch (Throwable t) {
+            LOGGER.warn("RadioMod: config load failed: {}", t.getMessage());
+        }
+
         // DeferredRegister setup
         ModBlocks.register(modEventBus);
         ModBlockEntities.register(modEventBus);

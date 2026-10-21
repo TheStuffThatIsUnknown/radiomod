@@ -99,9 +99,10 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
     }
 
     private void sendVol(int delta) {
-        int v = Math.max(0, Math.min(100, RadioPlayer.getGlobalVolume() + delta));
-        RadioPlayer.setGlobalVolume(v);
-        // Volume is purely client-side
+        String key = menu.getRadioKey();
+        int v = Math.max(0, Math.min(100, RadioPlayer.getVolume(key) + delta));
+        RadioPlayer.setVolume(key, v);
+        // Volume is per-radio and purely client-side
     }
 
     private void scroll(int dir) {
@@ -212,7 +213,6 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
         int ly = topPos + LIST_Y;
         String active = menu.blockEntity != null ? menu.blockEntity.getCurrentStation() : "off";
         List<RadioStation> stations = getCurrentStations();
-
         // 1-px border + background — border stays within [lx-1 .. lx+LIST_W] x [ly-1 .. ly+LIST_H]
         gfx.fill(lx - 1, ly - 1, lx + LIST_W + 1, ly + LIST_H + 1, COL_DIVIDER);
         gfx.fill(lx, ly, lx + LIST_W, ly + LIST_H, COL_BG);
@@ -223,6 +223,13 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
             gfx.drawCenteredString(font, I18n.get("gui.radiomod.loading"),
                     lx + LIST_W / 2, ly + LIST_H / 2 - 4, COL_TEXT_DIM);
             return;
+        }
+        // Custom tab with no user stations yet (issues #2/#6) — show where to add them.
+        if (cur.isCustom() && stations.size() <= 1) {
+            gfx.drawCenteredString(font, I18n.get("gui.radiomod.custom.empty"),
+                    lx + LIST_W / 2, ly + LIST_H / 2 - 9, COL_TEXT_DIM);
+            gfx.drawCenteredString(font, I18n.get("gui.radiomod.custom.hint"),
+                    lx + LIST_W / 2, ly + LIST_H / 2 + 3, COL_TEXT_DIM);
         }
 
         for (int i = 0; i < STATIONS_VIS && (scrollOffset + i) < stations.size(); i++) {
@@ -272,7 +279,7 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
     }
 
     private void drawVolumeSection(GuiGraphics gfx, int mouseX, int mouseY) {
-        int vol = RadioPlayer.getGlobalVolume();
+        int vol = RadioPlayer.getVolume(menu.getRadioKey());
         int secX = leftPos + LIST_X_REL;            // 8     — same left edge as list
         int secY = topPos + VOL_Y;                 // 194   — safely below list
         int secW = LIST_W;                           // 230   — same width as list, stops before scrollbar
@@ -365,11 +372,11 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
                 RadioStation selected = stations.get(scrollOffset + i);
                 String id = selected.getId();
                 String url = selected.getStreamUrl();
-                // Pass radioKey so server can locate this radio even inside a Sable SubLevel.
+                // Pass radioKey so server can locate this radio even inside a Sable SubLevel
+                // or a Create contraption/train (issue #4).
                 // Pass streamUrl so all clients receive it directly — no per-client API lookup needed.
-                String key = menu.blockEntity != null ? menu.blockEntity.getRadioKey() : "";
-                BlockPos pos = menu.blockEntity != null
-                        ? menu.blockEntity.getBlockPos() : BlockPos.ZERO;
+                String key = menu.getRadioKey();
+                BlockPos pos = menu.getRadioPos();
                 ModPayloads.sendSelectStation(pos, id, key, url);
                 if (menu.blockEntity != null) menu.blockEntity.setCurrentStation(id);
                 return true;
@@ -377,7 +384,7 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
         }
 
         // Volume buttons
-        int vol = RadioPlayer.getGlobalVolume();
+        int vol = RadioPlayer.getVolume(menu.getRadioKey());
         int secX = leftPos + LIST_X_REL;
         int btnGroupW = 32 + 4 + 24 + 4 + 24 + 4 + 32;
         int btnX0 = secX + (LIST_W - btnGroupW) / 2;
@@ -408,7 +415,7 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
         // Volume bar – click to set
         if (isOnVolBar(mx, my)) {
             draggingVolume = true;
-            sendVol(volFromMouseX(mx) - RadioPlayer.getGlobalVolume());
+            sendVol(volFromMouseX(mx) - RadioPlayer.getVolume(menu.getRadioKey()));
             return true;
         }
 
@@ -418,7 +425,7 @@ public class RadioScreen extends AbstractContainerScreen<RadioMenu> {
     @Override
     public boolean mouseDragged(double mx, double my, int btn, double dx, double dy) {
         if (draggingVolume) {
-            sendVol(volFromMouseX(mx) - RadioPlayer.getGlobalVolume());
+            sendVol(volFromMouseX(mx) - RadioPlayer.getVolume(menu.getRadioKey()));
             return true;
         }
         return super.mouseDragged(mx, my, btn, dx, dy);

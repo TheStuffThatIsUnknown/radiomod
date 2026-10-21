@@ -102,6 +102,8 @@ public class ModPayloads {
     /**
      * Server handler: receives station selection, finds the RadioBlockEntity,
      * resolves the world position and broadcasts to all players.
+     * Also mirrors the station to all linked speakers (issue #5) and validates
+     * custom-station URLs (issues #2 / #6).
      */
     private static void handleSelectStation(SelectStationPayload payload, IPayloadContext ctx) {
         ServerPlayer sender = (ServerPlayer) ctx.player();
@@ -123,13 +125,41 @@ public class ModPayloads {
             return;
         }
 
+        // Issues #2/#6 guard: custom/dyn URLs must be http(s); servers can disable customs.
+        String streamUrl = payload.streamUrl();
+        if (streamUrl != null && !streamUrl.isEmpty()) {
+            boolean isCustomId = payload.stationId().startsWith("custom_")
+                    || payload.stationId().startsWith("dyn_");
+            if (isCustomId && !com.radiomod.RadioConfig.isUrlAllowed(streamUrl)) {
+                LOGGER.warn("RadioMod [SERVER]: rejected disallowed custom URL from {}: {}",
+                        sender.getName().getString(), streamUrl);
+                return;
+            }
+            try {
+                com.radiomod.RadioConfig.load();
+                if (!com.radiomod.RadioConfig.allowCustomStations
+                        && payload.stationId().startsWith("custom_")) {
+                    LOGGER.warn("RadioMod [SERVER]: custom stations disabled, rejecting from {}",
+                            sender.getName().getString());
+                    return;
+                }
+                if (com.radiomod.RadioConfig.customRequireOp
+                        && payload.stationId().startsWith("custom_")
+                        && !sender.hasPermissions(2)) {
+                    LOGGER.warn("RadioMod [SERVER]: custom stations require OP, rejecting from {}",
+                            sender.getName().getString());
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
         Vec3 worldPos = getEffectiveWorldPos(radio, sender);
         String stationId = payload.stationId();
-        String streamUrl = payload.streamUrl();
-        radio.setCurrentStation(stationId);
+        radio.setCurrentStation(stationId, streamUrl);
 
-        BlockPos bp = radio.getBlockPos();
-        if (Math.abs(bp.getX()) > 1_000_000 || Math.abs(bp.getZ()) > 1_000_000) {
+        // Track moving radios (Sable SubLevel or Create contraption/train) for position updates.
+        if (needsPositionTracking(radio)) {
             if ("off".equals(stationId) || stationId.isBlank()) {
                 com.radiomod.ServerTickHandler.untrackRadio(radio.getRadioKey());
             } else {
@@ -194,6 +224,7 @@ public class ModPayloads {
      * @return Vec3 world position or null on error (SubLevel not resolvable)
      */
     public static Vec3 resolveWorldPosition(RadioBlockEntity radio) {
+        if (radio == null) return null;
         BlockPos bp = radio.getBlockPos();
         if (Math.abs(bp.getX()) > 1_000_000 || Math.abs(bp.getZ()) > 1_000_000) {
             Vec3 sablePos = tryGetSableWorldPosition(radio);
@@ -205,6 +236,7 @@ public class ModPayloads {
 
     /**
      * Determines the best world position for a radio. For SubLevel blocks Sable is tried first,
+     * for Create contraption/train blocks the contraption transform is tried (issue #4),
      * then the sender's position is used as a fallback.
      *
      * @param radio  The RadioBlockEntity
@@ -222,7 +254,134 @@ public class ModPayloads {
             return sender.position();
         }
 
+        // Issue #4: Create contraption/train — local coords are small, resolve via transform.
+        if (isContraptionLevel(radioLevel)) {
+            Vec3 contraptionPos = tryGetCreateWorldPosition(radio);
+            if (contraptionPos != null) return contraptionPos;
+            return sender.position();
+        }
+
         return Vec3.atCenterOf(bp);
+    }
+
+    /**
+     * True when the level looks like a Create contraption world
+     * (class name heuristic — no hard dependency on Create).
+     */
+    public static boolean isContraptionLevel(Level level) {
+        if (level == null) return false;
+        String name = level.getClass().getName().toLowerCase();
+        return name.contains("contraption");
+    }
+
+    /** True for SubLevel (Sable, &gt;1M offset) or Create contraption radios — both need position tracking. */
+    public static boolean needsPositionTracking(RadioBlockEntity radio) {
+        if (radio == null) return false;
+        BlockPos bp = radio.getBlockPos();
+        if (Math.abs(bp.getX()) > 1_000_000 || Math.abs(bp.getZ()) > 1_000_000) return true;
+        try {
+            return isContraptionLevel(radio.getLevel());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Transforms a Create-contraption-local block position into world coordinates.
+     * Tries common ContraptionWorld transform methods via reflection
+     * ({@code toGlobalVector}, {@code toWorldPos}, ...); returns null when
+     * Create is absent or the API differs.
+     */
+    private static Vec3 tryGetCreateWorldPosition(BlockEntity be) {
+        if (be == null || be.getLevel() == null) return null;
+        Object level = be.getLevel();
+        Vec3 localPos = Vec3.atCenterOf(be.getBlockPos());
+        // 1) Direct transform methods on the contraption world
+        Vec3 direct = invokeVecTransform(level, localPos,
+                "toGlobalVector", "toWorldPos", "toGlobal", "transformPosition",
+                "toWorldCoordinates", "contraptionToWorld");
+        if (direct != null) return direct;
+        // 2) Via contraption/entity reference held by the world
+        try {
+            for (String getter : new String[]{"getContraptionEntity", "getEntity", "getContraption"}) {
+                try {
+                    Object ref = level.getClass().getMethod(getter).invoke(level);
+                    if (ref != null) {
+                        Vec3 v = invokeVecTransform(ref, localPos,
+                                "toGlobalVector", "toWorldPos", "toGlobal", "transformPosition",
+                                "applyRotation");
+                        if (v != null) return v;
+                        // Last resort: entity position as approximation
+                        try {
+                            Object pos = ref.getClass().getMethod("position").invoke(ref);
+                            if (pos instanceof Vec3 vec) return vec;
+                        } catch (Exception ignored) {
+                        }
+                    }
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            for (java.lang.reflect.Field f : level.getClass().getDeclaredFields()) {
+                String n = f.getName().toLowerCase();
+                if (n.contains("contraption") || n.contains("entity")) {
+                    try {
+                        f.setAccessible(true);
+                        Object ref = f.get(level);
+                        if (ref != null) {
+                            Vec3 v = invokeVecTransform(ref, localPos,
+                                    "toGlobalVector", "toWorldPos", "toGlobal");
+                            if (v != null) return v;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /** Client-side twin of {@link #tryGetCreateWorldPosition} (called on the render thread, read-only). */
+    public static Vec3 tryGetClientCreateWorldPosition(BlockEntity be) {
+        return tryGetCreateWorldPosition(be);
+    }
+
+    /** Invokes the first matching single-Vec3 transform method; converts Vec3-like results. */
+    private static Vec3 invokeVecTransform(Object target, Vec3 arg, String... names) {
+        for (String name : names) {
+            for (java.lang.reflect.Method m : target.getClass().getMethods()) {
+                if (!name.equals(m.getName()) || m.getParameterCount() != 1) continue;
+                if (!m.getParameterTypes()[0].isAssignableFrom(Vec3.class)) continue;
+                try {
+                    Object out = m.invoke(target, arg);
+                    Vec3 v = toVec3(out);
+                    if (v != null) return v;
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Converts Vec3 / Vec3d-like (x/y/z methods or fields) results to Vec3. */
+    private static Vec3 toVec3(Object o) {
+        if (o instanceof Vec3 vec) return vec;
+        if (o == null) return null;
+        try {
+            double x, y, z;
+            try {
+                x = ((Number) o.getClass().getMethod("x").invoke(o)).doubleValue();
+                y = ((Number) o.getClass().getMethod("y").invoke(o)).doubleValue();
+                z = ((Number) o.getClass().getMethod("z").invoke(o)).doubleValue();
+            } catch (Exception e) {
+                x = ((Number) o.getClass().getField("x").get(o)).doubleValue();
+                y = ((Number) o.getClass().getField("y").get(o)).doubleValue();
+                z = ((Number) o.getClass().getField("z").get(o)).doubleValue();
+            }
+            return new Vec3(x, y, z);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

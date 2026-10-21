@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 
 import javax.sound.sampled.*;
 import java.io.BufferedInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URLConnection;
@@ -42,7 +43,6 @@ public class RadioPlayer {
         return t;
     });
 
-    private static int globalVolume = 50;
     private static volatile Boolean jlayerAvailable = null;
 
     private static boolean checkJLayerAvailable() {
@@ -121,17 +121,39 @@ public class RadioPlayer {
     }
 
     /**
-     * Sets the global volume (0-100). Also affects the maximum hearing range.
+     * Sets the volume (0-100) for a specific radio block. Also affects the maximum hearing range.
+     *
+     * @param blockKey Unique radio key "radiomod:<UUID>"
+     * @param vol      Volume 0-100
+     */
+    public static void setVolume(String blockKey, int vol) {
+        RadioPlayer p = ACTIVE.get(blockKey);
+        if (p != null) p.setVolume(vol);
+    }
+
+    /**
+     * Returns the volume (0-100) for a specific radio block, or 50 if not playing.
+     *
+     * @param blockKey Unique radio key "radiomod:<UUID>"
+     * @return Volume 0-100
+     */
+    public static int getVolume(String blockKey) {
+        RadioPlayer p = ACTIVE.get(blockKey);
+        return p != null ? p.volume : 50;
+    }
+
+    /**
+     * Sets this player's volume (0-100) and refreshes the audio line gain.
      *
      * @param vol Volume 0-100
      */
-    public static void setGlobalVolume(int vol) {
-        globalVolume = Math.max(0, Math.min(100, vol));
-        ACTIVE.values().forEach(RadioPlayer::updateVolume);
+    public void setVolume(int vol) {
+        this.volume = Math.max(0, Math.min(100, vol));
+        updateVolume();
     }
 
-    public static int getGlobalVolume() {
-        return globalVolume;
+    public int getVolume() {
+        return volume;
     }
 
     /**
@@ -150,6 +172,7 @@ public class RadioPlayer {
     private final String currentStationId;
     private final String radioKey;
     private volatile Vec3 blockPos;
+    private int volume = 50;
 
     private volatile boolean running = false;
     private volatile SourceDataLine line;
@@ -214,7 +237,22 @@ public class RadioPlayer {
                 }
             }
         } else {
-            blockPos = Vec3.atCenterOf(bp);
+            // Issue #4: Create contraption/train — resolve via transform when possible.
+            boolean contraption = false;
+            try {
+                contraption = be.getLevel() != null
+                        && be.getLevel().getClass().getName().toLowerCase().contains("contraption");
+            } catch (Exception ignored) {
+            }
+            if (contraption) {
+                Vec3 worldPos = com.radiomod.network.ModPayloads.tryGetClientCreateWorldPosition(be);
+                if (worldPos != null) {
+                    blockPos = worldPos;
+                }
+                // else: keep last known position (server rebroadcasts every 10 ticks anyway)
+            } else {
+                blockPos = Vec3.atCenterOf(bp);
+            }
         }
     }
 
@@ -335,12 +373,26 @@ public class RadioPlayer {
                     URLConnection conn = URI.create(url).toURL().openConnection();
                     conn.setConnectTimeout(8000);
                     conn.setReadTimeout(20000);
-                    conn.setRequestProperty("User-Agent", "RadioMod/1.0 Minecraft");
+                    conn.setRequestProperty("User-Agent", "RadioMod/1.1 Minecraft");
                     conn.setRequestProperty("Icy-MetaData", "0");
+
+                    String contentType = null;
+                    try {
+                        contentType = conn.getContentType();
+                    } catch (Exception ignored) {
+                    }
+                    boolean aac = isAacStream(url, contentType);
+                    if (aac) {
+                        LOGGER.info("RadioMod: AAC/AAC+ stream detected (Content-Type: {})", contentType);
+                    }
 
                     try (InputStream raw = conn.getInputStream();
                          BufferedInputStream bis = new BufferedInputStream(raw, 128 * 1024)) {
-                        streamDecode(bis);
+                        if (aac) {
+                            streamDecodeAac(bis);
+                        } else {
+                            streamDecodeMp3(bis);
+                        }
                     }
                 } catch (Exception e) {
                     if (running) {
@@ -354,6 +406,171 @@ public class RadioPlayer {
                 }
             }
         });
+    }
+
+    /**
+     * Detects AAC/AAC+ streams (issue #7) by URL suffix and HTTP Content-Type.
+     * MP3 remains the default.
+     */
+    private static boolean isAacStream(String url, String contentType) {
+        if (contentType != null) {
+            String ct = contentType.toLowerCase();
+            if (ct.contains("aac") || ct.contains("mp4") || ct.contains("x-aac")
+                    || ct.contains("aacp") || ct.contains("m4a")) {
+                return true;
+            }
+        }
+        if (url != null) {
+            String u = url.toLowerCase();
+            if (u.contains(".aac") || u.contains(".m4a") || u.contains(".mp4")
+                    || u.contains("aacp") || u.contains("/aac") || u.contains("codec=aac")
+                    || u.contains("type=aac")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Decodes MP3 frames and outputs them as PCM. Applies the computed
+     * gain (volume × distance attenuation) per sample.
+     */
+    private void streamDecodeMp3(InputStream in) throws Exception {
+        streamDecode(in);
+    }
+
+    /**
+     * Decodes AAC-LC / HE-AAC (AAC+) ADTS streams via JAAD (pure Java, bundled with jarJar).
+     * Implemented with reflection so a missing/mismatched JAAD jar degrades to a clear
+     * log message instead of a NoClassDefFoundError crash (issue #7).
+     *
+     * <p>JAAD API used (verified against JAADec sources):
+     * {@code ADTSDemultiplexer(InputStream)}, {@code getDecoderSpecificInfo()},
+     * {@code readNextFrame()}, {@code Decoder(byte[])},
+     * {@code decodeFrame(byte[], SampleBuffer)}, {@code SampleBuffer.getData()},
+     * {@code getSampleRate()}, {@code getChannels()}, {@code setBigEndian(boolean)}.
+     */
+    private void streamDecodeAac(InputStream in) throws Exception {
+        Class<?> demuxClass;
+        try {
+            demuxClass = Class.forName("net.sourceforge.jaad.adts.ADTSDemultiplexer");
+            Class.forName("net.sourceforge.jaad.aac.Decoder");
+            Class.forName("net.sourceforge.jaad.aac.SampleBuffer");
+        } catch (ClassNotFoundException e) {
+            throw new IOException("AAC stream requires JAAD (not on classpath). MP3-only fallback. " + e.getMessage());
+        }
+
+        Object demux;
+        try {
+            demux = demuxClass.getConstructor(InputStream.class).newInstance(in);
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            throw new IOException("Not an ADTS AAC stream: "
+                    + (ite.getCause() != null ? ite.getCause().getMessage() : ite.getMessage()));
+        }
+        byte[] decoderInfo = (byte[]) demuxClass.getMethod("getDecoderSpecificInfo").invoke(demux);
+        Class<?> decoderClass = Class.forName("net.sourceforge.jaad.aac.Decoder");
+        Class<?> bufClass = Class.forName("net.sourceforge.jaad.aac.SampleBuffer");
+        Object decoder = decoderClass.getConstructor(byte[].class).newInstance((Object) decoderInfo);
+        Object sampleBuf = bufClass.getConstructor().newInstance();
+        // JAAD outputs big-endian PCM by default — switch to little-endian once.
+        try {
+            bufClass.getMethod("setBigEndian", boolean.class).invoke(sampleBuf, false);
+        } catch (Exception ignored) {
+        }
+        java.lang.reflect.Method readFrame = demuxClass.getMethod("readNextFrame");
+        java.lang.reflect.Method decodeFrame = decoderClass.getMethod("decodeFrame", byte[].class, bufClass);
+        java.lang.reflect.Method getData = bufClass.getMethod("getData");
+
+        SourceDataLine localLine = null;
+        int lineRate = -1, lineChannels = -1;
+        int consecutiveErrors = 0;
+        try {
+            while (running) {
+                byte[] frame;
+                try {
+                    frame = (byte[]) readFrame.invoke(demux);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    if (ite.getCause() instanceof java.io.EOFException) break;
+                    throw ite;
+                }
+                if (frame == null) break;
+                try {
+                    decodeFrame.invoke(decoder, frame, sampleBuf);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    // One corrupt frame must not kill the stream — skip it.
+                    if (++consecutiveErrors > 20) throw ite;
+                    LOGGER.debug("RadioMod: skipping corrupt AAC frame: {}",
+                            ite.getCause() != null ? ite.getCause().getMessage() : ite.getMessage());
+                    continue;
+                }
+                consecutiveErrors = 0;
+                byte[] pcm = (byte[]) getData.invoke(sampleBuf);
+                if (pcm == null || pcm.length == 0) continue;
+
+                int sampleRate = reflectInt(sampleBuf, "getSampleRate", 44100);
+                int channels = reflectInt(sampleBuf, "getChannels", 2);
+                if (channels < 1) channels = 1;
+                if (channels > 2) channels = 2; // downmix guard: some HE-AAC reports 5.1
+                if (sampleRate < 8000) sampleRate = 44100;
+
+                if (localLine == null || sampleRate != lineRate || channels != lineChannels) {
+                    if (localLine != null) {
+                        try {
+                            localLine.drain();
+                            localLine.stop();
+                            localLine.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    AudioFormat fmt = new AudioFormat(
+                            AudioFormat.Encoding.PCM_SIGNED,
+                            sampleRate, 16, channels, channels * 2, sampleRate, false);
+                    DataLine.Info info = new DataLine.Info(SourceDataLine.class, fmt);
+                    localLine = (SourceDataLine) AudioSystem.getLine(info);
+                    localLine.open(fmt, 8192);
+                    localLine.start();
+                    line = localLine;
+                    lineRate = sampleRate;
+                    lineChannels = channels;
+                    updateVolume();
+                }
+
+                // JAAD SampleBuffer.getData() = 16-bit little-endian PCM. Apply gain per sample.
+                float gain = computeLinearGain();
+                int samples = pcm.length / 2;
+                byte[] out = new byte[samples * 2];
+                for (int i = 0; i < samples; i++) {
+                    int lo = pcm[i * 2] & 0xFF;
+                    int hi = pcm[i * 2 + 1]; // signed
+                    int sample = (hi << 8) | lo;
+                    int scaled = Math.round(sample * gain);
+                    if (scaled > 32767) scaled = 32767;
+                    if (scaled < -32768) scaled = -32768;
+                    out[i * 2] = (byte) (scaled & 0xFF);
+                    out[i * 2 + 1] = (byte) ((scaled >> 8) & 0xFF);
+                }
+                localLine.write(out, 0, out.length);
+            }
+        } finally {
+            if (localLine != null) {
+                try {
+                    localLine.drain();
+                    localLine.stop();
+                    localLine.close();
+                } catch (Exception ignored) {
+                }
+            }
+            if (line == localLine) line = null;
+        }
+    }
+
+    private static int reflectInt(Object target, String method, int fallback) {
+        try {
+            Object v = target.getClass().getMethod(method).invoke(target);
+            if (v instanceof Number n) return n.intValue();
+        } catch (Exception ignored) {
+        }
+        return fallback;
     }
 
     /**
@@ -450,7 +667,7 @@ public class RadioPlayer {
      * @return Gain value 0.0 (silent) to 1.0 (full volume)
      */
     private float computeLinearGain() {
-        float userGain = globalVolume / 100f;
+        float userGain = volume / 100f;
         if (userGain <= 0f) return 0f;
 
         float maxDist = BASE_MAX_DISTANCE * 2f * userGain;
